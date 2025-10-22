@@ -147,8 +147,12 @@ usage() {
     echo -e "\t    --bundle-version bundleVersion\tSpecify new bundle version (CFBundleVersion) number." >&2
     echo -e "\t\t\t\t\t\t\tWill apply for all nested apps and extensions." >&2
     echo -e "\t\t\t\t\t\t\tCan't use together with '-n, --version-number' option." >&2
-    echo -e "\t-b, --bundle-id bundleId\t\tSpecify new bundle identifier (CFBundleIdentifier)." >&2
-    echo -e "\t\t\t\t\t\t\tWarning: will NOT apply for nested apps and extensions." >&2
+    echo -e "\t-b, --bundle-id bundleId\t\tSpecify new bundle identifier (CFBundleIdentifier) for main app." >&2
+    echo -e "\t\t\t\t\t\t\tAlternatively you may specify bundle ID mappings for nested apps and extensions" >&2
+    echo -e "\t\t\t\t\t\t\tby providing -b option multiple times in the format old_bundle_id=new_bundle_id." >&2
+    echo -e "\t\t\t\t\t\t\t\t-b com.example.app" >&2
+    echo -e "\t\t\t\t\t\t\t\t-b com.example.app.widget=com.newteam.app.widget" >&2
+    echo -e "\t\t\t\t\t\t\t\t-b com.example.app.extension=com.newteam.app.extension" >&2
     echo -e "\t    --use-app-entitlements\t\tExtract app bundle codesigning entitlements and combine with entitlements from new provisioning profile." >&2
     echo -e "\t\t\t\t\t\t\tCan't use together with '-e, --entitlements' option." >&2
     echo -e "\t--keychain-path path\t\t\tSpecify the path to a keychain that /usr/bin/codesign should use." >&2
@@ -165,6 +169,8 @@ ORIGINAL_FILE="$1"
 CERTIFICATE="$2"
 ENTITLEMENTS=
 BUNDLE_IDENTIFIER=""
+BUNDLE_ID_MAPPING_KEYS=()    # Array of old bundle IDs
+BUNDLE_ID_MAPPING_VALUES=()  # Array of new bundle IDs (parallel to BUNDLE_ID_MAPPING_KEYS)
 DISPLAY_NAME=""
 KEYCHAIN=""
 VERSION_NUMBER=""
@@ -201,7 +207,15 @@ while [ "$1" != "" ]; do
             ;;
         -b | --bundle-id )
             shift
-            BUNDLE_IDENTIFIER="$1"
+            if [[ "$1" =~ .+=.+ ]]; then
+                # Format: old_bundle_id=new_bundle_id for nested apps/extensions
+                BUNDLE_ID_MAPPING_KEYS+=("${1%%=*}")
+                BUNDLE_ID_MAPPING_VALUES+=("${1#*=}")
+                log "Bundle ID mapping: '${1%%=*}' -> '${1#*=}'"
+            else
+                # Simple format for main app bundle ID
+                BUNDLE_IDENTIFIER="$1"
+            fi
             ;;
         -k | --keychain )
             shift
@@ -324,6 +338,24 @@ APP_NAME=$(ls "$TEMP_DIR/Payload/" | grep ".app$" | head -1)
 # Make sure that PATH includes the location of the PlistBuddy helper tool as its location is not standard
 export PATH=$PATH:/usr/libexec
 
+# Get mapped bundle ID for a given bundle identifier (bash 3.2 compatible)
+function get_mapped_bundle_id {
+    local SEARCH_BUNDLE_ID="$1"
+    local INDEX=0
+
+    for OLD_BUNDLE_ID in "${BUNDLE_ID_MAPPING_KEYS[@]}"; do
+        if [[ "$OLD_BUNDLE_ID" == "$SEARCH_BUNDLE_ID" ]]; then
+            echo "${BUNDLE_ID_MAPPING_VALUES[$INDEX]}"
+            return 0
+        fi
+        INDEX=$((INDEX + 1))
+    done
+
+    # Not found
+    echo ""
+    return 1
+}
+
 # Test whether two bundle identifiers match
 # The first one may contain the wildcard character '*', in which case pattern matching will be used unless the third parameter is "STRICT"
 function does_bundle_id_match {
@@ -411,11 +443,6 @@ function resign {
     local APP_IDENTIFIER_PREFIX=""
     local TEAM_IDENTIFIER=""
 
-    if [[ "$NESTED" == NESTED ]]; then
-        # Ignore bundle identifier for nested applications
-        BUNDLE_IDENTIFIER=""
-    fi
-
     # Make sure that the Info.plist file is where we expect it
     if [ ! -e "$APP_PATH/Info.plist" ]; then
         error "Expected file does not exist: '$APP_PATH/Info.plist'"
@@ -427,6 +454,18 @@ function resign {
     # Read in current values from the app
     local CURRENT_NAME=$(PlistBuddy -c "Print :CFBundleDisplayName" "$APP_PATH/Info.plist")
     local CURRENT_BUNDLE_IDENTIFIER=$(PlistBuddy -c "Print :CFBundleIdentifier" "$APP_PATH/Info.plist")
+
+    if [[ "$NESTED" == NESTED ]]; then
+        # For nested apps/extensions, check if there's a mapped bundle ID
+        local MAPPED_BUNDLE_ID=$(get_mapped_bundle_id "$CURRENT_BUNDLE_IDENTIFIER")
+        if [[ -n "$MAPPED_BUNDLE_ID" ]]; then
+            BUNDLE_IDENTIFIER="$MAPPED_BUNDLE_ID"
+            log "Using mapped bundle identifier for nested app '$CURRENT_BUNDLE_IDENTIFIER' -> '$BUNDLE_IDENTIFIER'"
+        else
+            # No mapping found, use default behavior (empty to use provisioning profile)
+            BUNDLE_IDENTIFIER=""
+        fi
+    fi
     local NEW_PROVISION=$(provision_for_bundle_id "${BUNDLE_IDENTIFIER:-$CURRENT_BUNDLE_IDENTIFIER}")
 
     if [[ "$NEW_PROVISION" == "" && "$NESTED" != NESTED ]]; then
